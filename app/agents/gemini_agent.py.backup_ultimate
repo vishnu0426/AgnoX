@@ -1,0 +1,675 @@
+import asyncio
+import os
+import sys
+import json
+import logging
+from typing import Optional, Dict, Any
+from datetime import datetime
+from pathlib import Path
+
+import asyncpg
+from dotenv import load_dotenv
+
+from livekit import agents, rtc, api
+from livekit.agents import (
+    JobContext,
+    AutoSubscribe,
+    WorkerOptions,
+    llm,
+)
+from livekit.plugins import google, silero, noise_cancellation
+from livekit.agents import room_io
+
+# --------------------------------------------------------------------
+# Local imports
+# --------------------------------------------------------------------
+sys.path.insert(0, str(Path(__file__).parent.parent.parent))
+
+from config.settings import settings
+from config.database import db_manager
+from app.services.customer_service import CustomerService
+from app.services.queue_manager import QueueManager
+from app.services.transcript_service import TranscriptService
+from app.services.sentiment_analyzer import SentimentAnalyzer
+from app.tools.account_tools import AccountTools
+from app.tools.scheduling_tools import SchedulingTools
+from app.tools.knowledge_base import KnowledgeBase
+
+load_dotenv()
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+)
+logger = logging.getLogger(__name__)
+
+
+# --------------------------------------------------------------------
+# FunctionContext compatibility layer
+# --------------------------------------------------------------------
+# We try a few different import paths to support different livekit-agents versions.
+# If none are available, we fall back to a small shim class that mimics the behavior
+# we need (ai_callable + ai_functions).
+try:
+    # Newer style: separate module
+    from livekit.agents.llm import function_context as _lk_function_context
+
+    FunctionContext = _lk_function_context.FunctionContext  # type: ignore[attr-defined]
+    logger.info("Using FunctionContext from livekit.agents.llm.function_context")
+except Exception:
+    try:
+        # Older style: FunctionContext defined directly on llm
+        FunctionContext = llm.FunctionContext  # type: ignore[attr-defined]
+        logger.info("Using FunctionContext from livekit.agents.llm")
+    except Exception:
+        # Last-resort shim – enough for tools to register & be read
+        logger.warning(
+            "LiveKit FunctionContext not found; using local shim. "
+            "Consider upgrading livekit-agents."
+        )
+        from typing import Callable, Dict as _Dict, Any as _Any
+
+        class FunctionContext:  # type: ignore[override]
+            def __init__(self) -> None:
+                self._fncs: _Dict[str, Callable[..., _Any]] = {}
+
+            def ai_callable(
+                self,
+                *,
+                name: str | None = None,
+                description: _Any | None = None,
+                auto_retry: bool = True,
+            ):
+                def deco(f: Callable[..., _Any]) -> Callable[..., _Any]:
+                    fn_name = name or f.__name__
+                    self._fncs[fn_name] = f
+                    return f
+
+                return deco
+
+            @property
+            def ai_functions(self) -> _Dict[str, Callable[..., _Any]]:
+                return self._fncs
+
+
+# --------------------------------------------------------------------
+# Call type constants
+# --------------------------------------------------------------------
+class CallType:
+    """Call type constants"""
+
+    INBOUND = "inbound"
+    OUTBOUND = "outbound"
+    CALLBACK = "callback"
+    TRANSFER = "transfer"
+
+
+# --------------------------------------------------------------------
+# Agent implementation
+# --------------------------------------------------------------------
+class GeminiCustomerServiceAgent:
+    """
+    Advanced customer service agent using Gemini Live API
+    Supports both inbound and outbound calls with enhanced features
+    """
+
+    def __init__(self):
+        """Initialize agent with database connections and services"""
+        self.db_pool: Optional[asyncpg.Pool] = None
+        self.customer_service: Optional[CustomerService] = None
+        self.queue_manager: Optional[QueueManager] = None
+        self.transcript_service: Optional[TranscriptService] = None
+        self.sentiment_analyzer: Optional[SentimentAnalyzer] = None
+        self.account_tools: Optional[AccountTools] = None
+        self.scheduling_tools: Optional[SchedulingTools] = None
+        self.knowledge_base: Optional[KnowledgeBase] = None
+
+        # Call state
+        self.session_id: Optional[int] = None
+        self.customer_id: Optional[int] = None
+        self.queue_id: Optional[int] = None
+        self.phone_number: Optional[str] = None
+        self.call_type: Optional[str] = None
+        self.transfer_requested = False
+        self.is_first_time_customer = False
+
+        logger.info("GeminiCustomerServiceAgent initialized")
+
+    # ----------------------------------------------------------------
+    # Initialization
+    # ----------------------------------------------------------------
+    async def initialize_database(self):
+        """Initialize database connection pool and services"""
+        try:
+            await db_manager.connect()
+            self.db_pool = db_manager.pool
+
+            self.customer_service = CustomerService(self.db_pool)
+            self.queue_manager = QueueManager(self.db_pool)
+            self.transcript_service = TranscriptService(self.db_pool)
+            self.sentiment_analyzer = SentimentAnalyzer(self.db_pool)
+            self.account_tools = AccountTools(self.db_pool)
+            self.scheduling_tools = SchedulingTools(self.db_pool)
+            self.knowledge_base = KnowledgeBase(self.db_pool)
+
+            logger.info("Database and services initialized successfully")
+        except Exception as e:
+            logger.error(f"Failed to initialize database: {e}", exc_info=True)
+            raise
+
+    # ----------------------------------------------------------------
+    # Customer context & system instructions
+    # ----------------------------------------------------------------
+    async def get_customer_context(self, phone_number: str) -> str:
+        """
+        Build comprehensive customer context for AI
+
+        Args:
+            phone_number: Customer phone number
+
+        Returns:
+            Formatted customer context string
+        """
+        try:
+            logger.info(f"Checking customer database for {phone_number}")
+
+            # Query customer database
+            customer = await self.customer_service.get_customer_info(phone_number)
+
+            if not customer:
+                # First-time caller
+                self.is_first_time_customer = True
+                logger.info(f"First-time customer detected: {phone_number}")
+                return (
+                    f"New customer calling from {phone_number}. "
+                    f"This is their first interaction with our service."
+                )
+
+            # Returning customer
+            self.customer_id = customer["customer_id"]
+            self.is_first_time_customer = False
+
+            total_calls = customer.get("total_calls", 0)
+            logger.info(
+                f"Returning customer (ID: {self.customer_id}): "
+                f"{total_calls} previous calls"
+            )
+
+            # Get recent call history
+            history = await self.customer_service.get_call_history(
+                customer["customer_id"], limit=3
+            )
+
+            # Build comprehensive context
+            context = f"""Customer Information:
+- Name: {customer.get('name', 'Unknown')}
+- Phone: {phone_number}
+- Customer ID: {customer['customer_id']}
+- Customer since: {customer.get('created_at', 'Unknown')}
+- Total previous calls: {total_calls}
+- Last call: {customer.get('last_call_time', 'Never')}
+"""
+
+            if history:
+                context += "\nRecent call history:\n"
+                for idx, call in enumerate(history, 1):
+                    summary = call.get("summary", "No summary available")
+                    duration = call.get("duration_seconds", 0)
+                    handled_by = call.get("handled_by", "unknown")
+                    sentiment = call.get("sentiment", "neutral")
+
+                    context += (
+                        f"{idx}. {call['start_time']} "
+                        f"({duration}s, {handled_by}, {sentiment}): {summary}\n"
+                    )
+
+            return context
+        except Exception as e:
+            logger.error(f"Error getting customer context: {e}", exc_info=True)
+            return f"Customer calling from {phone_number} (context unavailable)"
+
+    def create_system_instructions(self, customer_context: str, call_type: str) -> str:
+        """
+        Create system instructions tailored to call type
+
+        Args:
+            customer_context: Customer information string
+            call_type: Type of call (inbound/outbound/callback)
+
+        Returns:
+            System instructions for AI
+        """
+        # Base instructions
+        base_instructions = f"""You are a professional and empathetic customer service AI assistant.
+
+{customer_context}
+
+Your Core Responsibilities:
+1. Provide excellent customer service
+2. Listen actively to customer concerns
+3. Provide accurate information
+4. Resolve issues when possible
+5. Escalate to human agents when needed
+
+Communication Guidelines:
+- Be warm, friendly, and professional
+- Use customer's name when known
+- Show empathy and understanding
+- Keep responses concise (2-3 sentences max)
+- Avoid technical jargon unless customer uses it
+- Never make promises you cannot keep
+- If uncertain, escalate immediately
+
+Available Functions:
+- check_account_balance: Retrieve current balance
+- get_recent_transactions: View transaction history
+- update_contact_info: Modify contact details
+- schedule_callback: Set callback appointments
+- search_knowledge_base: Find answers to common questions
+- transfer_to_human: Escalate to human agent
+
+Transfer to Human When:
+- Customer explicitly requests
+- Issue requires human judgment
+- Customer shows frustration (sentiment alerts)
+- Billing disputes or refunds
+- Account security concerns
+- After 3 unsuccessful attempts
+- Privacy-sensitive matters
+"""
+
+        # Add call-type-specific instructions
+        if call_type == CallType.INBOUND:
+            if self.is_first_time_customer:
+                greeting_guide = """- Welcome them warmly as a new customer
+- Introduce yourself and the service
+- Be extra helpful and patient
+- Offer to explain how things work"""
+            else:
+                greeting_guide = """- Acknowledge them as a returning customer
+- Reference their history when relevant
+- Build on previous interactions
+- Show continuity in service"""
+
+            base_instructions += (
+                f"\n\nInbound Call - Greeting Guidelines:\n{greeting_guide}"
+            )
+
+        elif call_type == CallType.OUTBOUND:
+            base_instructions += """
+
+Outbound Call Guidelines:
+- Clearly identify yourself and the company
+- State the reason for the call immediately
+- Respect customer's time
+- Ask if it's a convenient time to talk
+- Be ready to schedule callback if needed
+"""
+
+        elif call_type == CallType.CALLBACK:
+            base_instructions += """
+
+Callback Call Guidelines:
+- Acknowledge this is a scheduled callback
+- Reference the original issue/reason
+- Thank them for their patience
+- Proceed directly to resolution
+"""
+
+        return base_instructions
+
+    # ----------------------------------------------------------------
+    # Agent session creation
+    # ----------------------------------------------------------------
+    async def create_agent_session(
+        self,
+        ctx: JobContext,
+        customer_context: str,
+        call_type: str,
+    ) -> agents.llm.LLM:
+        """
+        Create Gemini agent session with enhanced audio processing
+
+        Args:
+            ctx: Job context
+            customer_context: Customer information
+            call_type: Type of call
+
+        Returns:
+            Configured LLM session
+        """
+        try:
+            logger.info("Creating Gemini agent session with noise cancellation")
+
+            # System instructions
+            system_instructions = self.create_system_instructions(
+                customer_context, call_type
+            )
+
+            # Initialize Gemini model using settings
+            gemini_model = google.realtime.RealtimeModel(
+                model=settings.gemini_model,
+                voice=settings.gemini_voice,
+                temperature=settings.gemini_temperature,
+                instructions=system_instructions,
+            )
+
+            # Create agent session
+            assistant = agents.VoicePipelineAgent(
+                vad=silero.VAD.load(),
+                stt=google.STT(),
+                llm=gemini_model,
+                tts=google.TTS(voice=settings.gemini_voice),
+            )
+
+            # Setup audio processing pipeline (best-effort)
+            await self._setup_audio_pipeline(session, ctx)
+
+            logger.info("Agent session created successfully")
+            return assistant
+        except Exception as e:
+            logger.error(f"Failed to create agent session: {e}", exc_info=True)
+            raise
+
+    def _create_function_context(self) -> FunctionContext:
+        """
+        Create function context with all available tools
+
+        Returns:
+            Function context with tools
+        """
+        fnc_ctx = FunctionContext()
+
+        # Register all available functions
+        if self.account_tools:
+            fnc_ctx.ai_callable()(self.account_tools.check_account_balance)
+            fnc_ctx.ai_callable()(self.account_tools.get_recent_transactions)
+            fnc_ctx.ai_callable()(self.account_tools.update_contact_info)
+
+        if self.scheduling_tools:
+            fnc_ctx.ai_callable()(self.scheduling_tools.schedule_callback)
+            fnc_ctx.ai_callable()(self.scheduling_tools.check_availability)
+
+        if self.knowledge_base:
+            fnc_ctx.ai_callable()(self.knowledge_base.search_knowledge_base)
+
+        # Transfer function
+        @fnc_ctx.ai_callable()
+        async def transfer_to_human(reason: str) -> str:
+            """Transfer call to human agent"""
+            self.transfer_requested = True
+            logger.info(f"Transfer requested: {reason}")
+            return f"Transferring to human agent. Reason: {reason}"
+
+        return fnc_ctx
+
+    async def _setup_audio_pipeline(self, session: agents.llm.LLM, ctx: JobContext):
+        """
+        Setup audio processing pipeline with noise cancellation
+
+        Args:
+            session: LLM session
+            ctx: Job context
+        """
+        try:
+            # Example: set up noise cancellation or VAD here if needed.
+            # Leaving this as best-effort; if plugins aren't available, we just log and continue.
+            logger.info("Audio pipeline setup (no-op / best-effort)")
+        except Exception as e:
+            logger.error(f"Error setting up audio pipeline: {e}", exc_info=True)
+
+    # ----------------------------------------------------------------
+    # Event handlers (transcripts, sentiment, tools)
+    # ----------------------------------------------------------------
+    async def setup_event_handlers(self, session: agents.llm.LLM):
+        """
+        Setup event handlers for transcript and sentiment tracking
+
+        Args:
+            session: LLM session
+        """
+
+        @session.on("user_speech_committed")
+        async def on_user_speech(msg: agents.llm.ChatMessage):
+            """Handle user speech transcription"""
+            try:
+                if hasattr(msg, "content") and msg.content:
+                    text = msg.content
+                    logger.info(f"User: {text}")
+
+                    # Save user transcript
+                    await self.transcript_service.save_transcript(
+                        self.session_id,
+                        "customer",
+                        text,
+                        confidence=0.95,
+                    )
+
+                    # Analyze sentiment
+                    sentiment = await self.sentiment_analyzer.analyze_conversation(
+                        self.session_id,
+                        window_size=3,
+                    )
+
+                    if sentiment:
+                        polarity = sentiment.get("polarity", 0)
+                        label = sentiment.get("label", "neutral")
+                        logger.info(
+                            f"Sentiment: {label} (polarity: {polarity:.2f})"
+                        )
+
+                        if sentiment.get("recommend_transfer"):
+                            logger.warning(
+                                f"Negative sentiment detected in session {self.session_id}"
+                            )
+
+                        if sentiment.get("strong_negative"):
+                            logger.error(
+                                f"STRONG negative sentiment in session {self.session_id}"
+                            )
+            except Exception as e:
+                logger.error(f"Error handling user speech: {e}", exc_info=True)
+
+        @session.on("agent_speech_committed")
+        async def on_agent_speech(msg: agents.llm.ChatMessage):
+            """Handle agent speech transcription"""
+            try:
+                if hasattr(msg, "content") and msg.content:
+                    text = msg.content
+                    logger.info(f"Agent: {text}")
+
+                    # Save agent response transcript
+                    await self.transcript_service.save_transcript(
+                        self.session_id,
+                        "ai_agent",
+                        text,
+                        confidence=1.0,
+                    )
+            except Exception as e:
+                logger.error(f"Error handling agent speech: {e}", exc_info=True)
+
+        @session.on("function_calls_finished")
+        async def on_function_calls(calls):
+            """Handle function call completion"""
+            for call in calls:
+                function_name = getattr(call, "function_name", "unknown")
+                logger.info(f"Function executed: {function_name}")
+
+                # Save function call to transcript
+                await self.transcript_service.save_transcript(
+                    self.session_id,
+                    "system",
+                    f"Function called: {function_name}",
+                    confidence=1.0,
+                )
+
+                if function_name == "transfer_to_human" and self.transfer_requested:
+                    logger.info("Initiating transfer to human agent")
+
+    # ----------------------------------------------------------------
+    # Entrypoint & greeting
+    # ----------------------------------------------------------------
+    async def entrypoint(self, ctx: JobContext):
+        """
+        Main agent entrypoint - handles complete call flow
+
+        Args:
+            ctx: LiveKit job context
+        """
+        try:
+            # Initialize if needed
+            if not self.db_pool:
+                await self.initialize_database()
+
+            # Connect to room
+            await ctx.connect(auto_subscribe=AutoSubscribe.AUDIO_ONLY)
+            logger.info(f"Call connected to room: {ctx.room.name}")
+
+            # Extract metadata
+            metadata = json.loads(ctx.job.metadata or "{}")
+            self.phone_number = metadata.get("phone_number", "unknown")
+            self.call_type = metadata.get("call_type", CallType.INBOUND)
+            call_id = metadata.get("call_id", ctx.room.name)
+
+            logger.info(
+                f"Processing {self.call_type} call from: {self.phone_number} "
+                f"(Call ID: {call_id})"
+            )
+
+            # Get customer context
+            customer_context = await self.get_customer_context(self.phone_number)
+
+            # Create or get customer record
+            if not self.customer_id:
+                logger.info(f"Creating customer record for {self.phone_number}")
+                customer = await self.customer_service.get_or_create_customer(
+                    self.phone_number,
+                    name=f"Customer-{self.phone_number[-4:]}",
+                )
+                self.customer_id = customer["customer_id"]
+                logger.info(f"Customer ID: {self.customer_id}")
+
+            # Create call session record
+            logger.info(f"Creating call session for customer {self.customer_id}")
+            self.session_id = await self.customer_service.create_session(
+                self.customer_id,
+                ctx.room.name,
+            )
+            logger.info(f"Session created: ID={self.session_id}")
+
+            # Add to queue (for inbound calls)
+            if self.call_type == CallType.INBOUND:
+                logger.info("Adding to call queue")
+                self.queue_id = await self.queue_manager.add_to_queue(
+                    self.customer_id,
+                    self.phone_number,
+                    ctx.room.name,
+                    priority=1 if self.is_first_time_customer else 2,
+                )
+                logger.info(f"Queue entry created: ID={self.queue_id}")
+
+            # Create AI agent session
+            assistant = await self.create_agent_session(
+                ctx,
+                customer_context,
+                self.call_type,
+            )
+
+            # Setup event handlers
+            await self.setup_event_handlers(assistant)
+
+            # Start the session
+            assistant.start(ctx.room)
+            await asyncio.sleep(0)  # Allow event loop to process
+
+            # Send greeting
+            greeting = self.get_personalized_greeting()
+            logger.info(f"Sending greeting: {greeting}")
+            await assistant.say(greeting, allow_interruptions=True)
+
+            logger.info(
+                f"Agent started for {self.call_type} call "
+                f"({'NEW' if self.is_first_time_customer else 'RETURNING'} customer)"
+            )
+
+            # Wait for conversation to complete
+            await session.aclose()
+
+            # Call completion
+            logger.info(f"Call ended for session {self.session_id}")
+
+            await self.customer_service.update_session_end(
+                self.session_id,
+                {
+                    "transfer_requested": self.transfer_requested,
+                    "completed_at": datetime.now().isoformat(),
+                    "first_time_customer": self.is_first_time_customer,
+                    "call_type": self.call_type,
+                },
+            )
+
+            if self.queue_id:
+                await self.queue_manager.mark_completed(self.queue_id)
+
+            logger.info(
+                f"Session {self.session_id} completed successfully "
+                f"({'transferred' if self.transfer_requested else 'resolved by AI'})"
+            )
+
+        except Exception as e:
+            logger.error(f"Error in agent entrypoint: {e}", exc_info=True)
+            if self.queue_id:
+                await self.queue_manager.mark_abandoned(self.queue_id)
+            raise
+
+    def get_personalized_greeting(self) -> str:
+        """
+        Generate personalized greeting based on customer status and call type
+
+        Returns:
+            Greeting message
+        """
+        if self.call_type == CallType.OUTBOUND:
+            return (
+                "Hello, this is calling from our customer service team. "
+                "Is this a convenient time to talk?"
+            )
+
+        elif self.call_type == CallType.CALLBACK:
+            return (
+                "Hello! This is your scheduled callback from our customer service team. "
+                "Thank you for your patience. How can I help you today?"
+            )
+
+        # Inbound call
+        if self.is_first_time_customer:
+            return (
+                "Hello! Thank you for calling. Welcome to our service. "
+                "I'm your AI assistant, and I'm here to help you. "
+                "How can I assist you today?"
+            )
+        else:
+            return (
+                "Hello! Welcome back. Thank you for calling again. "
+                "How can I help you today?"
+            )
+
+
+# --------------------------------------------------------------------
+# Module-level entrypoint for LiveKit worker
+# --------------------------------------------------------------------
+agent_instance = GeminiCustomerServiceAgent()
+
+
+async def entrypoint(ctx: JobContext):
+    """Entry point for LiveKit"""
+    await agent_instance.entrypoint(ctx)
+
+
+if __name__ == "__main__":
+    agents.cli.run_app(
+        WorkerOptions(
+            entrypoint_fnc=entrypoint,
+            agent_name="AgnoX-AI-Agent",
+        )
+    )
